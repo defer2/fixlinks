@@ -1,7 +1,10 @@
-$settingsFile='conf.ini'
+$settingsFile='./conf.ini'
 
 Get-Content $settingsFile | foreach-object -begin {$settings=@{}} -process { $k = $_.split('=',2); if(($k[0].CompareTo("") -ne 0) -and ($k[0].StartsWith("[") -ne $True)) { $settings.Add($k[0], $k[1]) } }
 
+$logFile=$settings.Get_Item("logFile")
+$logFileERR=$settings.Get_Item("logFileERR")
+$logFileUPD=$settings.Get_Item("logFileUPD")
 
 $DBServer_SRC=$settings.Get_Item("DBServer_SRC")
 $DBName_SRC=$settings.Get_Item("DBName_SRC")
@@ -14,7 +17,8 @@ $DBUser_TGT=$settings.Get_Item("DBUser_TGT")
 $DBPassword_TGT=$settings.Get_Item("DBPassword_TGT")
 
 
-
+#Clean log file 
+"## FixLinks" | Out-File -FilePath $logFile
 #################################################################################################### FUNCIONES
 function getTime($nil){
 	$a = Get-Date
@@ -29,31 +33,49 @@ function logToFile([string]$Message){
 }
 
 
-function getDocumentsWithLinks($documentsCollections){
+# Get documents with broken links imported in the target system
+function getDocumentsWithLinks(){
 	logToFile "### Getting documents with links in target system"
 	$query = "select ref_persid,actual_text from long_texts where actual_text like '%OpenDocumentViewer(%' or actual_text like '%OpenDocument(%'"
 
-	logToFile "### $query"
-	logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
+	#logToFile "### $query"
+	#logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
 
 	push-location
-	$rows = Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT -Query $query
+	$rows = Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT -MaxCharLength 80000 -Query $query 
     pop-location
 
+    $documentsCollections = New-Object System.Collections.ArrayList
+
+    # object: document
+    # document.persid
+    # document.actual_text
+    # document.related_documents[]: related_document
+    # related_document.id_old
 	foreach ($row in $rows){
 		$oneDocument = New-Object System.Object
 		$relatedDocuments = New-Object System.Collections.ArrayList
 
 		$oneDocument | Add-Member -MemberType NoteProperty -Name "persid" -Value $row.ref_persid
 		$oneDocument | Add-Member -MemberType NoteProperty -Name "actual_text" -Value $row.actual_text
-		($row.actual_text | Select-String "/OpenDocument(Viewer)?\(([0-9]{6})(,[0-9])?\)/gs" -AllMatches) | Foreach-Object {$_.Matches} | Foreach-Object { $relatedDocuments.Add((New-Object System.Object) | Add-Member -MemberType NoteProperty -Name "id_old" -Value $_.Groups[2].Value) }
+
+        $matches = ([regex]'OpenDocument(Viewer)?\(([0-9]{6})(,[0-9])?\)').Matches($row.actual_text);
+     
+        foreach($match in $matches){
+            $doc = New-Object System.Object
+            $doc | Add-Member -MemberType NoteProperty -Name "id_old" -Value $match.Groups[2].Value
+            $relatedDocuments.Add($doc)
+            # DEBUG
+            "KB persid:{0} - Related document id (SRC):{1}" -f $row.ref_persid, $doc.id_old | Out-File -FilePath $logFile -Append
+        }
+
 		$oneDocument | Add-Member -MemberType NoteProperty -Name "related_documents" -Value $relatedDocuments
 		
 		$documentsCollections.Add($oneDocument) | Out-Null
 	}
 
 	#Printing documentsCollections
-	logToFile ($documentsCollections | Format-Table | Out-String)
+	#logToFile ($documentsCollections | Format-Table | Out-String)
 	return $documentsCollections
 }
 
@@ -62,49 +84,63 @@ function getRelatedDocumentsInfoFromSource($documents){
 
 	foreach($document in $documents){
 		foreach($related_document in $document.related_documents){
-			$query = "select title from skeletons where id = $related_document.id_old"
-			logToFile "### $query"
-			logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_SRC -Database $DBName_SRC -Username $DBUser_SRC -Password $DBPassword_SRC"
+			$query = "select title from skeletons where id = "+$related_document.id_old
+			#logToFile "### $query"
+			#logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_SRC -Database $DBName_SRC -Username $DBUser_SRC -Password $DBPassword_SRC"
 
 			push-location
 			$row = Invoke-Sqlcmd -ServerInstance $DBServer_SRC -Database $DBName_SRC -Username $DBUser_SRC -Password $DBPassword_SRC -Query $query
 			pop-location
 
+        
+
 			if(-Not $row){
-				logToFile "### NOT FOUND: document title in source for related_document_old_id:$related_document.id_old - parent document:$document.persid"
+				
+                ### NOT FOUND: document id in source for related_document_old_id:{0} - parent document:{1}' -f $related_document.id_old, $document.persid	 | Out-File -FilePath $logFile -Append
 			}else{
 				$related_document | Add-Member -MemberType NoteProperty -Name "title" -Value $row.title	
+                # DEBUG
+                "KB persid (TGT):{0} - Related document id (SRC):{1} - title {2}" -f $document.persid, $related_document.id_old, $row.title | Out-File -FilePath $logFile -Append
 			}
 		}
 	}
 
 	#Printing documentsCollections
-	logToFile ($documents | Format-Table | Out-String)
-	return $documentsCollections
+	#logToFile ($documents | Format-Table | Out-String)
+	return $documents
 }
 
 function getRelatedDocumentsInfoFromTarget($documents){
 	logToFile "### Getting related documents' info from target system"
-
+    $documentsFound = 0
+    $documentosNotFound = 0
 	foreach($document in $documents){
 		foreach($related_document in $document.related_documents){
-			$query = "select top 1 id from skeletons where title = '$related_document.title'"
-			logToFile "### $query"
-			logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
+			$query = "select top 1 id from skeletons where title ='"+$related_document.title+"'"
+			#logToFile "### $query"
+			#logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
 
 			push-location
 			$row = Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT -Query $query
 			pop-location
 
 			if(-Not $row){
-				logToFile "### NOT FOUND: document id in target for related_document_title:$related_document.title - parent document:$document.persid"
+                $documentosNotFound++
+				'### NOT FOUND: document id in target for related_document_title:{0} - parent document:{1}' -f $related_document.title, $document.persid	 | Out-File -FilePath $logFile -Append
 			}else{
-				$related_document | Add-Member -MemberType NoteProperty -Name "id" -Value $row.id	
+                $documentsFound++
+				$related_document | Add-Member -MemberType NoteProperty -Name "id" -Value $row.id
+             
+                 "KB persid:{0} - Related document id (SRC):{1} - title {2} - Related document id (TGT):{3}" -f $document.persid, $related_document.id_old, $related_document.title, $row.id	 | Out-File -FilePath $logFile -Append
 			}	
 		}
 	}
 	
-	return $documentsCollections
+    "###### SUMMARY" | Out-File -FilePath $logFile -Append
+    "###### DOCUMENTS: {0}" -f $documents.Count | Out-File -FilePath $logFile -Append 
+    "###### DOCUMENTS FOUND: {0}" -f $documentsFound | Out-File -FilePath $logFile -Append
+    "###### DOCUMENTS NOT FOUND: {0}" -f $documentosNotFound | Out-File -FilePath $logFile -Append
+	return $documents
 }
 
 function generateUpdateSentenceForDocuments($documents){
@@ -112,8 +148,18 @@ function generateUpdateSentenceForDocuments($documents){
 
 	foreach($document in $documents){
 		foreach($related_document in $document.related_documents){
-			$query = "UPDATE long_texts SET actual_text=REPLACE(actual_text,'$related_document.old_id','$related_document.id') WHERE ref_persid='$document.persid'"
-			logToFile $query
+            if($related_document.id_old -and $related_document.id -and $document.persid){        
+                $query = "UPDATE long_texts SET actual_text=REPLACE(CAST(actual_text as NVarchar(MAX)),'OpenDocumentViewer("+$related_document.id_old+"','OpenDocumentViewer("+$related_document.id+"') WHERE ref_persid='"+$document.persid+"'"
+                $query | Out-File -FilePath $logFileUPD -Append
+                #logToFile $query
+
+                $query = "UPDATE long_texts SET actual_text=REPLACE(CAST(actual_text as NVarchar(MAX)),'OpenDocument("+$related_document.id_old+"','OpenDocument("+$related_document.id+"') WHERE ref_persid='"+$document.persid+"'"
+                $query | Out-File -FilePath $logFileUPD -Append
+			    #logToFile $query
+            }else{
+                "UPDATE long_texts SET actual_text=REPLACE(actual_text,'"+$related_document.id_old+"','"+$related_document.id+"') WHERE ref_persid='"+$document.persid+"'" | Out-File -FilePath $logFileERR -Append
+            }
+			
 		}
 	}
 	logToFile "####"
@@ -123,13 +169,13 @@ function generateUpdateSentenceForDocuments($documents){
 
 function getDocumentsWithAttachments(){
 	logToFile "### Getting documents with attachments in target system"
-	$query = "select ref_persid,actual_text from long_texts where actual_text like '%OpenDocumentViewer(%' or actual_text like '%OpenDocument(%'"
+	$query = "select ref_persid,actual_text from long_texts where actual_text like '%AttmntId=(%'"
 
 	logToFile "### $query"
 	logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
 
 	push-location
-	$rows = Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT -Query $query
+	$rows = Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT  -MaxCharLength 80000 -Query $query
     pop-location
 
 	$documentsCollections = New-Object System.Collections.ArrayList
@@ -139,7 +185,17 @@ function getDocumentsWithAttachments(){
 
 		$oneDocument | Add-Member -MemberType NoteProperty -Name "persid" -Value $row.ref_persid
 		$oneDocument | Add-Member -MemberType NoteProperty -Name "actual_text" -Value $row.actual_text
-		($row.actual_text | Select-String "/AttmntId=([0-9]{6,7})/gs" -AllMatches) | Foreach-Object {$_.Matches} | Foreach-Object { $relatedImages.Add((New-Object System.Object) | Add-Member -MemberType NoteProperty -Name "id_old" -Value $_.Groups[2].Value) }
+
+        $matches = ([regex]'AttmntId=([0-9]{6,7})').Matches($row.actual_text);
+
+        
+
+        foreach($match in $matches){
+            $doc = New-Object System.Object
+            $doc | Add-Member -MemberType NoteProperty -Name "id_old" -Value $match.Groups[0].Value
+            $relatedImages.Add($doc)
+        }
+
 		$oneDocument | Add-Member -MemberType NoteProperty -Name "related_attachments" -Value $relatedAttachments
 		
 		$documentsCollections.Add($oneDocument) | Out-Null
@@ -156,7 +212,7 @@ function validateIfAttachmentsAreBroken($attachments){
 
 	foreach($attachment in $attachments){
 		foreach($related_attachment in $document.related_attachments){
-			$query = "select id from attmnt where id = $related_attachment.id_old"
+			$query = "select id from attmnt where id = "+$related_attachment.id_old
 			logToFile "### $query"
 			logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
 
@@ -183,7 +239,7 @@ function getRelatedDocumentsAttachmentsInfoFromSource($documents){
 
 	foreach($document in $documents){
 		foreach($related_attachment in $document.related_attachments){
-			$query = "select orig_file_name,file_size from attmnt where id = $related_attachment.id_old"
+			$query = "select orig_file_name,file_size from attmnt where id = "+$related_attachment.id_old
 			logToFile "### $query"
 			logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_SRC -Database $DBName_SRC -Username $DBUser_SRC -Password $DBPassword_SRC"
 
@@ -202,7 +258,7 @@ function getRelatedDocumentsAttachmentsInfoFromSource($documents){
 
 	#Printing documentsCollections
 	logToFile ($documents | Format-Table | Out-String)
-	return $documentsCollections
+	return $documents
 }
 
 function getRelatedAttachmentsInfoFromTarget($documents){
@@ -210,7 +266,7 @@ function getRelatedAttachmentsInfoFromTarget($documents){
 
 	foreach($document in $documents){
 		foreach($related_attachment in $document.related_attachments){
-			$query = "select top 1 id from attmnt where orig_file_name = '$related_attachment.orig_file_name'"
+			$query = "select top 1 id from attmnt where orig_file_name = '"+$related_attachment.orig_file_name+"'"
 			logToFile "### $query"
 			logToFile "### Invoke-Sqlcmd -ServerInstance $DBServer_TGT -Database $DBName_TGT -Username $DBUser_TGT -Password $DBPassword_TGT"
 
@@ -226,7 +282,7 @@ function getRelatedAttachmentsInfoFromTarget($documents){
 		}
 	}
 	
-	return $documentsCollections
+	return $documents
 }
 
 function generateUpdateSentenceForAttachments($documents){
@@ -243,7 +299,7 @@ function generateUpdateSentenceForAttachments($documents){
 
 
 #################################################################################################### MAIN
-logToFile " ## FixLinks"
+ 
 
 try{
 	$documentsWithLinks = New-Object System.Collections.ArrayList
@@ -254,14 +310,14 @@ try{
 
 	generateUpdateSentenceForDocuments $documentsWithLinks
 
-	$documentsWithAttachments = New-Object System.Collections.ArrayList
+#	$documentsWithAttachments = New-Object System.Collections.ArrayList
 
-	$documentsWithAttachments = getDocumentsWithAttachments 
-	$documentWithBrokenAttachments = validateIfAttachmentsAreBroken $documentsWithAttachments
-	$documentWithBrokenAttachments = getRelatedDocumentsAttachmentsInfoFromSource $documentWithBrokenAttachments
-	$documentWithBrokenAttachments = getRelatedDocumentsInfoFromTarget $documentWithBrokenAttachments
+#	$documentsWithAttachments = getDocumentsWithAttachments 
+#	$documentWithBrokenAttachments = validateIfAttachmentsAreBroken $documentsWithAttachments
+#	$documentWithBrokenAttachments = getRelatedDocumentsAttachmentsInfoFromSource $documentWithBrokenAttachments
+#	$documentWithBrokenAttachments = getRelatedDocumentsInfoFromTarget $documentWithBrokenAttachments
 
-	generateUpdateSentenceForAttachments $documentsWithLinks
+#	generateUpdateSentenceForAttachments $documentsWithLinks
 }catch{
 	logToFile " ## EXCEPTION ERROR"
 	logToFile " ## $_"
