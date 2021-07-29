@@ -11,6 +11,9 @@ Create conf.ini in script root directory with this properties:
 ```
 [Logs]
 logFile=fixlinks.log
+logFileERR=fixlinksERR.log
+logFileUPD=fixlinksUPD.log
+
 
 [Databases]
 DBServer_SRC=<SERVER>,<PORT>
